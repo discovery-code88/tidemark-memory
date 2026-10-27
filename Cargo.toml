@@ -1,0 +1,30 @@
+[package]
+name = "tidemark-memory"
+version = "1.0.0"
+edition = "2021"
+description = "Verbatim conversational memory with dated records and hybrid search (Add/Search API)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "tidemark"
+path = "src/main.rs"
+
+[dependencies]
+tidemark-engine = { path = "engine" }
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+sha2 = "0.10"
+tower-http = { version = "0.6", features = ["compression-gzip"] }
+subtle = "2"
+hex = "0.4"
+ort = "=2.0.0-rc.13"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[profile.release]
+opt-level = 3
