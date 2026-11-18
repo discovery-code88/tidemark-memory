@@ -192,8 +192,7 @@ changed.
 **Kept as is:** the conservative duration rule. "I've lived here for three years" and "I've frozen my membership
 for three months" need different readings; restoring approximate onsets is a separate candidate.
 
-Files: `~/.cache/tidemark-dev/change-diag/independent/` (`SCORING_FIRST_RUN.md`, `SCORING_SECOND_RUN.md`, outputs and
-locks).
+The scoring records of both runs (outputs and locks) are kept with the development records, not in this repository.
 
 ## Quotation guard and UTC offset (2026-11-12; development checks, no model calls)
 
@@ -226,8 +225,7 @@ previous run. A fixed offset is not a time zone.
 
 ## Temporal-parser round closed (2026-11-12)
 
-- Release checks before closing (local, no model calls): 19 of 19 integration checks passed
-  (`~/.cache/tidemark-dev/change-diag/integration/`): each message of a mixed-offset request uses its own offset;
+- Release checks before closing (local, no model calls): 19 of 19 integration checks passed: each message of a mixed-offset request uses its own offset;
   Search-time `applies` reads the same local day as the Add-time note; a follow-up carries only its own sentence
   and that sentence's notes; an out-of-range offset is rejected and stores nothing.
 - Two scoping defects found by those checks and fixed: a note for a phrase that also occurs inside a quotation
@@ -310,5 +308,5 @@ and the 51 change questions.
 **Reading:** at 100 results the reranker changes order, not content. Its benefit therefore depends on the consumer
 being sensitive to order or cutting the list short, which this check cannot show, and its throughput is far below
 the bursts in the live log. Not enabled; the next gate is a capped answer comparison through the consuming pipeline.
-Details: `~/.cache/tidemark-dev/change-diag/rerank-100/RESULTS.md`.
+The full results are kept with the development records, not in this repository.
 

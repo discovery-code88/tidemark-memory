@@ -5,7 +5,7 @@ import argparse, json, os, random, re, time, urllib.request
 p = argparse.ArgumentParser()
 p.add_argument("--url", required=True); p.add_argument("--key", required=True)
 p.add_argument("--users", type=int, default=4); p.add_argument("--seed", type=int, default=0); p.add_argument("--label", default="audit")
-p.add_argument("--data", default=os.path.expanduser("~/.cache/unlimited-memory-recall/practice"))
+p.add_argument("--data", default="personamem", help="folder with the PersonaMem files (default: ./personamem)")
 a = p.parse_args()
 H = {"Authorization": f"Token {a.key}", "Content-Type": "application/json"}
 def call(method, path, body=None):
