@@ -60,7 +60,7 @@ fn retrieval_stopword(token: &str) -> bool {
     )
 }
 
-fn meaningful_retrieval_tokens(text: &str) -> Vec<String> {
+pub(crate) fn meaningful_retrieval_tokens(text: &str) -> Vec<String> {
     let mut tokens = MemoryEngine::tokenize(text)
         .into_iter()
         .filter(|token| token.chars().count() > 1)
@@ -71,7 +71,7 @@ fn meaningful_retrieval_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-fn retrieval_token_forms(token: &str) -> Vec<String> {
+pub(crate) fn retrieval_token_forms(token: &str) -> Vec<String> {
     let token = token.to_lowercase();
     let mut forms = vec![token.clone()];
     if !token.is_ascii() {
@@ -452,6 +452,9 @@ impl MemoryEngine {
             index.scores(query, &records)
         });
         let semantic_weight = crate::semantic_retrieval::retrieval_weight();
+        // Per-memory text features are cached; the query's are computed once.
+        let mut feature_cache = self.token_sets.0.lock().unwrap_or_else(|e| e.into_inner());
+        let qf = feature_cache.query(query, &q_tokens);
         let scored = self
             .memories
             .iter()
@@ -475,9 +478,10 @@ impl MemoryEngine {
                 )
             })
             .map(|m| {
-                let vector = Self::cosine_tf(&q_tokens, &m.tokens);
-                let keyword = Self::jaccard(&q_tokens, &m.tokens);
-                let lexical_score = lexical_query_coverage(query, &m.content);
+                let mf = feature_cache.features(m.id, &m.tokens, &m.content);
+                let vector = qf.cosine(&mf);
+                let keyword = qf.jaccard(&mf);
+                let lexical_score = qf.coverage(&mf);
                 let time = Self::time_decay(m.created_at);
                 let trust = m.trust;
 

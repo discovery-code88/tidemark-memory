@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory_engine_ingest::TokenSetCache;
 
 
 
@@ -25,6 +26,8 @@ pub(crate) struct MemoryEngine {
     pub(crate) consolidation_jobs: Vec<ConsolidationJob>,
     pub(crate) cache: HashMap<String, CacheEntry>,
     pub(crate) candidate_cache_revision: u64,
+    /// Token sets of memories for the write gate's novelty check (a cache).
+    pub(crate) token_sets: TokenSetCache,
     pub(crate) user_preferences: HashSet<String>,
     pub(crate) write_gate_thresholds: WriteGateThresholds,
     pub(crate) auto_consolidation: AutoConsolidationConfig,
@@ -238,6 +241,7 @@ impl MemoryEngine {
             consolidation_jobs: Vec::new(),
             cache: HashMap::new(),
             candidate_cache_revision: 0,
+            token_sets: TokenSetCache::default(),
             user_preferences: prefs,
             write_gate_thresholds,
             auto_consolidation: AutoConsolidationConfig::default(),

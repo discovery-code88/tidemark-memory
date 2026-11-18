@@ -16,7 +16,7 @@ const STOPWORDS: &[&str] = &[
 /// Lower-case word tokens without stop words, lightly stemmed.
 /// Chinese, Japanese (kana) and Korean characters: written without spaces, so
 /// they are indexed as overlapping character pairs.
-fn is_cjk(c: char) -> bool {
+pub fn is_cjk(c: char) -> bool {
     matches!(c as u32,
         0x3040..=0x30FF   // Hiragana, Katakana
         | 0x3400..=0x4DBF // CJK Extension A
@@ -180,6 +180,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incremental_bm25_scores_equal_rebuilt_bm25() {
+        let texts = ["the red kite flies", "kite kite boat", "", "sun and sea and sand", "a red boat on the sea", "kite"];
+        let docs = texts.iter().map(|t| tokens(t)).collect::<Vec<_>>();
+        let mut index = Bm25Index::default();
+        for (i, d) in docs.iter().enumerate() {
+            index.add(d);
+            let slices = docs[..=i].iter().map(|d| d.as_slice()).collect::<Vec<_>>();
+            for q in ["red kite", "sea boat", "nothing here", "kite"] {
+                let old = Bm25::new(slices.clone()).scores(&tokens(q));
+                let new = index.scores(slices.iter().copied(), &tokens(q));
+                assert_eq!(old.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), new.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "{q} after {i}");
+            }
+        }
+    }
+
+    #[test]
     fn user_lines_skip_headers_and_other_speakers() {
         let block = "[Friday 15 March 2024, 12:00]\nuser: Always use type hints.\nassistant: Sure.\nCaroline: hi";
         assert_eq!(user_lines_with(block, true), ["Always use type hints."]);
@@ -247,6 +263,64 @@ mod tests {
     fn fusion_rewards_agreement() {
         let fused = fuse(&[3.0, 2.0, 0.0], &[0.1, 0.9, 0.2], 0.5, 60.0);
         assert_eq!(fused[0].0, 1);
+    }
+}
+
+/// BM25 statistics kept up to date as documents are added, so a search does
+/// not rebuild them over all records. Scores are identical to `Bm25` over the
+/// same documents in the same order.
+#[derive(Default)]
+pub struct Bm25Index {
+    df: HashMap<String, usize>,
+    total_len: usize,
+    n: usize,
+}
+
+impl Bm25Index {
+    /// Number of indexed documents containing `term`.
+    pub fn df(&self, term: &str) -> usize {
+        self.df.get(term).copied().unwrap_or(0)
+    }
+
+    /// Number of indexed documents.
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn add(&mut self, doc: &[String]) {
+        let mut seen = std::collections::HashSet::new();
+        for t in doc {
+            if seen.insert(t.as_str()) {
+                *self.df.entry(t.clone()).or_insert(0) += 1;
+            }
+        }
+        self.total_len += doc.len();
+        self.n += 1;
+    }
+
+    /// Scores of `docs` (the indexed documents, in the order they were added).
+    pub fn scores<'a>(&self, docs: impl Iterator<Item = &'a [String]>, query: &[String]) -> Vec<f32> {
+        let n = self.n as f32;
+        let avg_len = (self.total_len as f32 / self.n.max(1) as f32).max(1.0);
+        let (k1, b) = (1.2f32, 0.75f32);
+        let mut q = query.to_vec();
+        q.sort();
+        q.dedup();
+        docs.map(|doc| {
+            let len = doc.len() as f32;
+            q.iter()
+                .map(|term| {
+                    let tf = doc.iter().filter(|t| *t == term).count() as f32;
+                    if tf == 0.0 {
+                        return 0.0;
+                    }
+                    let df = *self.df.get(term.as_str()).unwrap_or(&0) as f32;
+                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                    idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * len / avg_len))
+                })
+                .sum()
+        })
+        .collect()
     }
 }
 

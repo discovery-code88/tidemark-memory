@@ -46,14 +46,20 @@ Week-, weekend- and weekday-based expressions deliberately stay relative to the 
 1. The memory engine ranks the user's records (it returns only what it judges relevant, typically 10–20 records).
 2. The remaining places up to `top_k` are filled by reciprocal-rank fusion (k = 60, equal weights) of BM25 over record text (including dates and time notes) and cosine similarity of `text-embedding-v4` embeddings of the message text.
 3. A second ranking over only the user's own lines (`user: …`, BM25 plus the record's embedding) is added to the fused score with weight 1 (`TIDEMARK_USER_WEIGHT`). Questions are mostly about what the user said, which long assistant replies would otherwise outweigh.
-4. The user's standing instructions and preferences ("Always …", "Never …", "From now on …", "I prefer …"), ranked among themselves, take up to 10 slots at the end of the results (`TIDEMARK_INSTRUCTION_SLOTS`), each as a short item labelled `[standing instruction, <date>]`.
+4. The user's standing instructions and preferences ("Always …", "Never …", "From now on …", "I prefer …"), ranked among themselves, take up to 10 slots at the end of the results (`TIDEMARK_INSTRUCTION_SLOTS`), each as a short item labelled `[standing instruction, <date>]`. (This was the 1.0.0 default used for the leaderboard; from 1.2 the slots are off unless configured.)
 5. Multiple-choice `options` are appended to the query. At most `top_k` items are returned, with strictly descending scores.
 
 BEAM (placeholder embeddings, `bench/beam_recall.py`), share of evidence messages in the top 100: 100K-token split 67% → 85% with steps 3–4, 1M-token split (5 conversations) 55% → 66%; the top 10 is unchanged. LongMemEval-S stays at 100%; LoCoMo is unaffected (its messages name their speaker, so no record has `user:` lines). Truncating the results (`TIDEMARK_MAX_RESULTS`, `TIDEMARK_MAX_CHARS`, off) only lost evidence on BEAM.
 
 With real `text-embedding-v4` embeddings (2026-10-26), share of evidence messages in the top 100, new rankings off → defaults: BEAM 100K (20 conversations, 355 questions) 79.4% → 88.2%; BEAM 1M (5 conversations, 89 questions) 65.1% → 70.4%; LongMemEval-S (18 haystacks) 100% in both, 94.4% → 100% within the top 25. Summarization questions, which mostly need assistant replies, lose (100K 48.2% → 42.9%, 1M 18.9% → 12.0%), mostly through the user weight (with it off and the instruction slots kept: 46.6% and 17.7%); every other type gains or holds. Embedding cost: about 350 tokens per record (4.3 characters per token); about 0.15 M tokens per BEAM 100K conversation, 1.0 M per BEAM 1M conversation, 0.12 M per LongMemEval-S haystack.
 
-**Input format caveat.** These replays send each message as `user: …` / `assistant: …`, which is what steps 3–4 detect. AML's own Add requests (seen in its smoke test) look different: `[dataset][session_n][D1:6][text] Speaker: …`, with speaker names or source labels (`Caroline`, `Christina Baker` for BEAM's user, `NARRATION`, `document`), and no role that reaches the record text. Only 98 of the 730 smoke-test records contained a `user:` line. The gains above therefore hold for the replayed format and are not evidence of gains on AML; for most AML data the user ranking and instruction slots have little to act on. A faithful replay of AML's input is the next step.
+**Input format.** These replays send each message as `user: …` / `assistant: …`, which is what steps 3–4 detect. The Agent Memory Leaderboard's full evaluation used the same plain format for most data (`user:` / `assistant:` lines, named speakers in LoCoMo and scripts, `Corpus:` / `source:` for documents): half of the 152,216 records it stored contain a `user:` line, so steps 3–4 were active. Its smoke test, in contrast, sends a tagged sample (`[dataset][session][turn][type] Speaker: …`) on which they rarely fire; an earlier version of this report generalized from that sample. One gap remains on the evaluated input: lines after the first of a multiline user message are not counted as the user's (`TIDEMARK_USER_LINES=continued` changes this; not yet measured).
+
+## Agent Memory Leaderboard (Cycle 2, 2026)
+
+Tidemark v1.0 (tag `v1.0`, deployed unchanged) scored **52.2** on the full textual evaluation (open-source track, answer model gpt-4o-mini, text-embedding-v4). By capability: fact recall 55.2, compositional inference 50.6, temporal and event reasoning 44.2, memory governance 70.5 (summarization 24.1, deletion and forgetting 15.0), personalization 33.4, context learning 47.4, safety and privacy 58.4, streaming 46.9. For reference, the best open-source entry of Cycle 1 scored about 45 and the best overall 58.0.
+
+During the run the cache limit had to be raised from 2 GB to 14 GB (configuration only): with ~1,500 histories most users had been evicted when the search phase began, and reloading the largest ones (up to 8,458 records) took longer than the leaderboard's 100 s request timeout. Version 1.1 makes that reload about 4.5 times faster.
 
 ## 4. Measurements (LoCoMo, placeholder embeddings)
 
@@ -95,6 +101,23 @@ Same records (5 messages), hybrid ranking alone vs engine first + hybrid fill:
 | **engine first + fill** | **74.1%** | **85.1%** | **90.3%** | **96.6%** | **85.9%** |
 
 On its own the engine returns too few records (median 15) to use a 100-record budget. Combined, it improves the top ranks, especially for temporal questions, without losing recall.
+
+**Update (November 2026, real `text-embedding-v4` embeddings).** The comparison above does not hold with real embeddings.
+
+Setup: the same 1,977 questions with 5-message records, both backends on the same binary and the same embeddings, `top_k` 10.
+
+| | all@10 | temporal all@10 |
+|---|---|---|
+| hybrid ranking | **81.9%** | **90.9%** |
+| engine first + fill | 73.2% | 85.0% |
+
+On categories 1–4, evidence-turn recall is 77.0% for hybrid ranking and 66.4% for engine first + fill.
+
+- **Losses:** hybrid ranking alone loses 99 evidence turns that engine first finds, and gains 374. The losses are mostly multi-hop list questions.
+- **At `top_k` 25** the gap shrinks to +1.3 points.
+- **LongMemEval-S** (54 questions) shows the same direction: recall of turns that contain the answer is 88.5% vs 69.0% at `top_k` 10.
+
+This measures retrieval only. On an author-created holdout, the answer comparison was inconclusive. Engine first therefore stays the default (docs/ARCHITECTURE.md, "Engine priority").
 
 ### 4.4 Ideas that did not help
 

@@ -551,8 +551,16 @@ impl LlmCall<'_> {
     /// A server that rejects native JSON output is retried once without it
     /// and remembered, so its later calls skip it.
     pub(crate) async fn complete(&self, request: &LlmRequest<'_>) -> Result<String, String> {
+        self.complete_with_usage(request, &UsagePaths::default()).await.map(|(text, _)| text)
+    }
+
+    /// `complete` plus the tokens the provider reported (read from the reply,
+    /// or from a command's output with `paths.command`).
+    pub(crate) async fn complete_with_usage(&self, request: &LlmRequest<'_>, paths: &UsagePaths) -> Result<(String, Option<TokenUsage>), String> {
         if self.endpoint.is_command() {
-            return self.endpoint.run_command(request.model, &self.endpoint.command_prompt(request)).await;
+            let (reply, log) = self.endpoint.run_command_logged(request.model, &self.endpoint.command_prompt(request)).await?;
+            let usage = paths.command.as_ref().and_then(|pattern| TokenUsage::from_command_log(&log, pattern));
+            return Ok((reply, usage));
         }
         let gateway = crate::provider_egress::ProviderEgressGateway::from_env();
         let endpoint = self.endpoint.endpoint(request.model);
@@ -582,7 +590,8 @@ impl LlmCall<'_> {
             if !(200..300).contains(&response.status) {
                 return Err(format!("llm_http_status:{}", response.status));
             }
-            return self.endpoint.extract_text(&response.payload);
+            let usage = TokenUsage::from_reply(&response.payload, paths);
+            return self.endpoint.extract_text(&response.payload).map(|text| (text, usage));
         }
     }
 }

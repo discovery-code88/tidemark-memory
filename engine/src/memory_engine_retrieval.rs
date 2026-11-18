@@ -733,6 +733,8 @@ impl MemoryEngine {
     }
 
     pub(crate) fn update_memory(&mut self, req: &MemoryUpdateRequest) -> Option<MemoryBrowserItem> {
+        // May rewrite a memory's tokens.
+        self.token_sets.invalidate();
         let pos = self
             .memories
             .iter()
@@ -808,6 +810,8 @@ impl MemoryEngine {
         &mut self,
         req: &MemoryContextReviewActionRequest,
     ) -> Result<MemoryContextReviewActionResponse, String> {
+        // May rewrite memories' tokens.
+        self.token_sets.invalidate();
         let action = req.action.trim().to_ascii_lowercase();
         let now = Utc::now();
         let reason = req

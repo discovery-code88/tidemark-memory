@@ -1,0 +1,15 @@
+# Tidemark with a persistent database volume.
+#   cp .env.example .env   # then fill in TIDEMARK_API_KEYS and the embedding settings
+#   docker compose up -d
+services:
+  tidemark:
+    build: .
+    image: tidemark:1.1.0
+    env_file: .env
+    ports:
+      - "127.0.0.1:18200:18200"
+    volumes:
+      - tidemark-data:/data
+    restart: unless-stopped
+volumes:
+  tidemark-data:

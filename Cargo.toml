@@ -1,6 +1,6 @@
 [package]
 name = "tidemark-memory"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "Verbatim conversational memory with dated records and hybrid search (Add/Search API)"
 license = "Apache-2.0"

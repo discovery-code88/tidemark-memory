@@ -14,9 +14,7 @@ impl MemoryEngine {
     }
 
     /// The largest Jaccard similarity between `a` and any of `others`, equal to
-    /// folding `jaccard` with `max` but without building two sets per pair:
-    /// `a`'s set is built once, one scratch set is reused, and token lists too
-    /// short to beat the best so far are skipped (J(a, b) <= |b| / |a|).
+    /// folding `jaccard` with `max` (kept as the reference; see the tests).
     pub(crate) fn max_jaccard<'a>(a: &[String], others: impl Iterator<Item = &'a [String]>) -> f32 {
         type Fnv = std::hash::BuildHasherDefault<FnvHasher>;
         let sa: HashSet<&str, Fnv> = a.iter().map(String::as_str).collect();
@@ -37,6 +35,36 @@ impl MemoryEngine {
             if union > 0 {
                 best = best.max(inter as f32 / union as f32);
             }
+            if best >= 1.0 {
+                break;
+            }
+        }
+        best
+    }
+
+    /// The write gate's novelty input: the largest Jaccard similarity between
+    /// `tokens` and the memories of `conversation_id` in `layer`. Same value as
+    /// `max_jaccard` over those memories, computed on cached token sets: tokens
+    /// are interned to integers, each memory's sorted set is built once, and a
+    /// memory is skipped when even a full overlap could not beat the best so far
+    /// (J(a, b) <= min(|a|, |b|) / max(|a|, |b|)).
+    pub(crate) fn novelty_max_jaccard(&self, tokens: &[String], conversation_id: &str, layer: &MemoryLayer) -> f32 {
+        let mut cache = self.token_sets.0.lock().unwrap_or_else(|e| e.into_inner());
+        let a = cache.set_of(tokens);
+        let mut best = 0.0_f32;
+        for m in self.memories.iter().filter(|m| m.conversation_id == conversation_id && &m.layer == layer) {
+            let b = cache.memory_set(m.id, &m.tokens);
+            let (na, nb) = (a.len(), b.len());
+            let (lo, hi) = if na < nb { (na, nb) } else { (nb, na) };
+            if hi == 0 {
+                continue;
+            }
+            if (lo as f32 / hi as f32) < best {
+                continue;
+            }
+            let inter = sorted_intersection(&a, &b);
+            let union = na + nb - inter;
+            best = best.max(inter as f32 / union as f32);
             if best >= 1.0 {
                 break;
             }
@@ -107,14 +135,7 @@ impl MemoryEngine {
     }
 
     pub(crate) fn write_score(&self, req: &IngestRequest, tokens: &[String]) -> f32 {
-        let novelty = 1.0
-            - Self::max_jaccard(
-                tokens,
-                self.memories
-                    .iter()
-                    .filter(|m| m.conversation_id == req.conversation_id && m.layer == req.layer)
-                    .map(|m| m.tokens.as_slice()),
-            );
+        let novelty = 1.0 - self.novelty_max_jaccard(tokens, &req.conversation_id, &req.layer);
 
         let reusable_markers = [
             "规则",
@@ -519,6 +540,198 @@ impl MemoryEngine {
     }
 }
 
+/// Token sets for the novelty check: tokens interned to integers (exact, no
+/// hash collisions) and each memory's sorted, deduplicated set, by memory ID.
+/// Cleared by `invalidate` wherever a memory's tokens are rewritten; memory IDs
+/// are never reused. Not part of the engine's state: a clone starts empty.
+#[derive(Default)]
+pub(crate) struct TokenSetCache(pub(crate) std::sync::Mutex<TokenSets>);
+
+#[derive(Default)]
+pub(crate) struct TokenSets {
+    ids: HashMap<String, u32>,
+    sets: HashMap<u64, std::sync::Arc<[u32]>>,
+    features: HashMap<u64, std::sync::Arc<MemoryFeatures>>,
+}
+
+/// What retrieval compares a query with, precomputed once per memory.
+pub(crate) struct MemoryFeatures {
+    /// Sorted, deduplicated token IDs (Jaccard).
+    set: std::sync::Arc<[u32]>,
+    /// Term frequencies by token ID, sorted, and their norm (cosine).
+    tf: Vec<(u32, f32)>,
+    norm: f32,
+    /// Lowercased content and the IDs of its retrieval word forms (coverage).
+    lower: String,
+    forms: Vec<u32>,
+}
+
+/// The query's side of the same comparisons, computed once per search.
+pub(crate) struct QueryFeatures {
+    set: Vec<u32>,
+    tf: Vec<(u32, f32)>,
+    norm: f32,
+    lower: String,
+    /// For each meaningful query term, the IDs of its word forms.
+    terms: Vec<Vec<u32>>,
+}
+
+impl TokenSets {
+    fn intern(&mut self, t: &str) -> u32 {
+        if let Some(id) = self.ids.get(t) {
+            return *id;
+        }
+        let id = self.ids.len() as u32;
+        self.ids.insert(t.to_string(), id);
+        id
+    }
+
+    /// Term frequencies (sorted by ID) and their norm, summed in ID order.
+    fn tf_of(&mut self, tokens: &[String]) -> (Vec<(u32, f32)>, f32) {
+        let mut ids = tokens.iter().map(|t| self.intern(t)).collect::<Vec<u32>>();
+        ids.sort_unstable();
+        let mut tf: Vec<(u32, f32)> = Vec::new();
+        for id in ids {
+            match tf.last_mut() {
+                Some((last, n)) if *last == id => *n += 1.0,
+                _ => tf.push((id, 1.0)),
+            }
+        }
+        let norm = tf.iter().map(|(_, v)| v * v).sum::<f32>().sqrt();
+        (tf, norm)
+    }
+
+    pub(crate) fn features(&mut self, id: u64, tokens: &[String], content: &str) -> std::sync::Arc<MemoryFeatures> {
+        if let Some(f) = self.features.get(&id) {
+            return f.clone();
+        }
+        let set = self.memory_set(id, tokens);
+        let (tf, norm) = self.tf_of(tokens);
+        let lower = content.to_lowercase();
+        let mut forms = MemoryEngine::tokenize(&lower)
+            .into_iter()
+            .flat_map(|token| crate::memory_engine_query::retrieval_token_forms(&token))
+            .map(|f| self.intern(&f))
+            .collect::<Vec<u32>>();
+        forms.sort_unstable();
+        forms.dedup();
+        let f = std::sync::Arc::new(MemoryFeatures { set, tf, norm, lower, forms });
+        self.features.insert(id, f.clone());
+        f
+    }
+
+    pub(crate) fn query(&mut self, query: &str, q_tokens: &[String]) -> QueryFeatures {
+        let set = self.set_of(q_tokens).to_vec();
+        let (tf, norm) = self.tf_of(q_tokens);
+        let lower = query.trim().to_lowercase();
+        let terms = crate::memory_engine_query::meaningful_retrieval_tokens(&lower)
+            .iter()
+            .map(|term| crate::memory_engine_query::retrieval_token_forms(term).iter().map(|f| self.intern(f)).collect())
+            .collect();
+        QueryFeatures { set, tf, norm, lower, terms }
+    }
+}
+
+impl QueryFeatures {
+    /// Same value as `MemoryEngine::jaccard(q_tokens, memory tokens)`.
+    pub(crate) fn jaccard(&self, m: &MemoryFeatures) -> f32 {
+        let inter = sorted_intersection(&self.set, &m.set);
+        let union = self.set.len() + m.set.len() - inter;
+        if union == 0 { 0.0 } else { inter as f32 / union as f32 }
+    }
+
+    /// `MemoryEngine::cosine_tf`, with sums in token-ID order (the original
+    /// sums in hash-map order, which varies from map to map).
+    pub(crate) fn cosine(&self, m: &MemoryFeatures) -> f32 {
+        if self.norm == 0.0 || m.norm == 0.0 {
+            return 0.0;
+        }
+        let (mut i, mut j, mut dot) = (0, 0, 0.0_f32);
+        while i < self.tf.len() && j < m.tf.len() {
+            match self.tf[i].0.cmp(&m.tf[j].0) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    dot += self.tf[i].1 * m.tf[j].1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        dot / (self.norm * m.norm)
+    }
+
+    /// Same value as `lexical_query_coverage(query, memory content)`.
+    pub(crate) fn coverage(&self, m: &MemoryFeatures) -> f32 {
+        if self.lower.is_empty() || m.lower.is_empty() {
+            return 0.0;
+        }
+        if m.lower.contains(&self.lower) {
+            return 1.0;
+        }
+        if self.terms.is_empty() {
+            return 0.0;
+        }
+        let hits = self.terms.iter().filter(|forms| forms.iter().any(|f| m.forms.binary_search(f).is_ok())).count();
+        hits as f32 / self.terms.len() as f32
+    }
+}
+
+impl TokenSets {
+    fn set_of(&mut self, tokens: &[String]) -> std::sync::Arc<[u32]> {
+        let mut v = tokens.iter().map(|t| self.intern(t)).collect::<Vec<u32>>();
+        v.sort_unstable();
+        v.dedup();
+        v.into()
+    }
+
+    fn memory_set(&mut self, id: u64, tokens: &[String]) -> std::sync::Arc<[u32]> {
+        if let Some(s) = self.sets.get(&id) {
+            return s.clone();
+        }
+        let s = self.set_of(tokens);
+        self.sets.insert(id, s.clone());
+        s
+    }
+}
+
+impl TokenSetCache {
+    pub(crate) fn invalidate(&self) {
+        let mut c = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        c.sets.clear();
+        c.features.clear();
+    }
+}
+
+impl Clone for TokenSetCache {
+    fn clone(&self) -> Self {
+        TokenSetCache::default()
+    }
+}
+
+impl std::fmt::Debug for TokenSetCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TokenSetCache({} sets)", self.0.lock().map(|c| c.sets.len()).unwrap_or(0))
+    }
+}
+
+/// Size of the intersection of two sorted, deduplicated slices.
+fn sorted_intersection(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    n
+}
+
 /// FNV-1a: a fast hasher for short token strings (no HashDoS concern here).
 #[derive(Default)]
 pub(crate) struct FnvHasher(u64);
@@ -540,6 +753,111 @@ impl std::hash::Hasher for FnvHasher {
 #[cfg(test)]
 mod max_jaccard_tests {
     use super::*;
+
+    fn engine_with(texts: &[String]) -> MemoryEngine {
+        let mut e = MemoryEngine::with_write_gate_thresholds(WriteGateThresholds::default());
+        for t in texts {
+            let req: IngestRequest = serde_json::from_value(serde_json::json!({"conversation_id": "c", "layer": "event", "content": t, "source": "test"})).unwrap();
+            e.ingest(req);
+        }
+        e
+    }
+
+    fn reference(e: &MemoryEngine, tokens: &[String]) -> f32 {
+        MemoryEngine::max_jaccard(tokens, e.memories.iter().filter(|m| m.conversation_id == "c" && m.layer == MemoryLayer::Event).map(|m| m.tokens.as_slice()))
+    }
+
+    #[test]
+    fn cached_novelty_equals_the_reference_and_survives_invalidation() {
+        let words = ["kite", "beach", "red", "sun", "dog", "sea", "sand", "wind", "boat", "rain", "cat", "hill"];
+        let text = |i: usize, n: usize| (0..n).map(|k| words[(i * 7 + k * k * 3) % words.len()]).collect::<Vec<_>>().join(" ");
+        let texts = (0..40).map(|i| format!("Alice said {} today", text(i, 3 + i % 9))).collect::<Vec<_>>();
+        let mut e = engine_with(&texts[..30]);
+        for t in &texts[30..] {
+            let tokens = MemoryEngine::tokenize(t);
+            assert_eq!(e.novelty_max_jaccard(&tokens, "c", &MemoryLayer::Event).to_bits(), reference(&e, &tokens).to_bits(), "{t}");
+        }
+        // A rewritten memory must not be answered from a stale set.
+        let first = e.memories.iter().position(|m| m.layer == MemoryLayer::Event).unwrap();
+        e.memories[first].tokens = MemoryEngine::tokenize("completely different words zebra quartz");
+        e.token_sets.invalidate();
+        let probe = MemoryEngine::tokenize("zebra quartz words");
+        assert_eq!(e.novelty_max_jaccard(&probe, "c", &MemoryLayer::Event).to_bits(), reference(&e, &probe).to_bits());
+    }
+
+    fn assert_features_match(e: &MemoryEngine, query: &str) -> usize {
+        let q_tokens = MemoryEngine::tokenize(query);
+        let mut cache = e.token_sets.0.lock().unwrap();
+        let qf = cache.query(query, &q_tokens);
+        let mut n = 0;
+        for m in &e.memories {
+            let mf = cache.features(m.id, &m.tokens, &m.content);
+            assert_eq!(qf.jaccard(&mf).to_bits(), MemoryEngine::jaccard(&q_tokens, &m.tokens).to_bits(), "jaccard, memory {} / {query}", m.id);
+            assert_eq!(qf.coverage(&mf).to_bits(), crate::memory_engine_query::lexical_query_coverage(query, &m.content).to_bits(), "coverage, memory {} / {query}", m.id);
+            let (new, old) = (qf.cosine(&mf), MemoryEngine::cosine_tf(&q_tokens, &m.tokens));
+            assert!((new - old).abs() <= 1e-6 * old.abs().max(1.0), "cosine, memory {}: {new} vs {old} / {query}", m.id);
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn cached_search_features_match_the_original_functions() {
+        let texts = ["Caroline: I went to the LGBTQ support group yesterday and it was so powerful!",
+                     "Melanie: I painted a sunrise over the lake last week; painting relaxes me.",
+                     "user: Always format code snippets with syntax highlighting, please.",
+                     "assistant: Sure. Here is the Flask route: @app.route('/login') def login(): ...",
+                     "Caroline: The support group meets every Tuesday; I'm going again."].map(String::from);
+        let e = engine_with(&texts);
+        for q in ["When did Caroline go to the support group?", "What does Melanie paint?", "flask login route",
+                  "support group", "", "THE LAKE SUNRISE", "went going goes"] {
+            assert!(assert_features_match(&e, q) > 0);
+        }
+    }
+
+    /// Real-data check of the search features, run on request:
+    /// TIDEMARK_FEATURE_CHECK_FILE=records.jsonl cargo test --release --lib search_features_on_real -- --ignored
+    #[test]
+    #[ignore]
+    fn search_features_on_real_records_match() {
+        let Ok(path) = std::env::var("TIDEMARK_FEATURE_CHECK_FILE") else { return };
+        let texts = std::fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str::<String>(l).unwrap()).collect::<Vec<_>>();
+        let e = engine_with(&texts);
+        let mut n = 0;
+        for q in ["What did I decide about the database schema?", "When did I start the project?", "What programming language do I prefer?",
+                  "How many tests did I write last week?", "Which library did I replace and why?", "What was the deadline I mentioned?",
+                  "Summarize what I said about deployment.", "Did I ever mention Docker or Kubernetes?"] {
+            n += assert_features_match(&e, q);
+        }
+        eprintln!("{n} memory-query pairs match ({} memories)", e.memories.len());
+    }
+
+    /// Real-data check, run on request: TIDEMARK_NOVELTY_CHECK_FILE=records.jsonl
+    /// (one JSON string per line) cargo test --release --lib novelty_on_real -- --ignored
+    #[test]
+    #[ignore]
+    fn novelty_on_real_records_equals_the_reference() {
+        let Ok(path) = std::env::var("TIDEMARK_NOVELTY_CHECK_FILE") else { return };
+        let limit = std::env::var("TIDEMARK_NOVELTY_CHECK_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let mut e = MemoryEngine::with_write_gate_thresholds(WriteGateThresholds::default());
+        let (mut n, t0) = (0usize, std::time::Instant::now());
+        let (mut t_new, mut t_ref) = (0.0f64, 0.0f64);
+        for line in std::fs::read_to_string(path).unwrap().lines().take(limit) {
+            let content: String = serde_json::from_str(line).unwrap();
+            let tokens = MemoryEngine::tokenize(&content);
+            let a = std::time::Instant::now();
+            let fast = e.novelty_max_jaccard(&tokens, "c", &MemoryLayer::Event);
+            let b = std::time::Instant::now();
+            let slow = reference(&e, &tokens);
+            t_new += (b - a).as_secs_f64();
+            t_ref += b.elapsed().as_secs_f64();
+            assert_eq!(fast.to_bits(), slow.to_bits(), "record {n}: {fast} vs {slow}");
+            let req: IngestRequest = serde_json::from_value(serde_json::json!({"conversation_id": "c", "layer": "event", "content": content, "source": "test"})).unwrap();
+            e.ingest(req);
+            n += 1;
+        }
+        eprintln!("{n} records identical; novelty time new {t_new:.1} s vs reference {t_ref:.1} s; total {:.0} s", t0.elapsed().as_secs_f64());
+    }
 
     #[test]
     fn max_jaccard_equals_folded_jaccard() {

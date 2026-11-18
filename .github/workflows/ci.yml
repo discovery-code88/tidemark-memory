@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            engine
+      - name: Service tests
+        run: cargo test --release --locked
+      - name: Engine tests
+        run: cargo test --release --lib
+        working-directory: engine
+      - name: Build the service binary (cargo test does not produce target/release/tidemark)
+        run: cargo build --release --locked
+      - name: Live API checks (placeholder embeddings, no keys needed)
+        run: |
+          TIDEMARK_API_KEYS=ci-key TIDEMARK_DB=/tmp/ci.sqlite TIDEMARK_PORT=18200 ./target/release/tidemark &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:18200/health && break; sleep 1; done
+          python3 bench/conformance.py http://127.0.0.1:18200 ci-key
+          python3 bench/api_check.py http://127.0.0.1:18200 ci-key
+          python3 bench/rules_check.py http://127.0.0.1:18200 ci-key
+          python3 bench/passages_check.py http://127.0.0.1:18200 ci-key
+          python3 -m pip install ./clients/python
+          python3 bench/client_check.py http://127.0.0.1:18200 ci-key
+          python3 examples/quickstart.py http://127.0.0.1:18200 ci-key
+          TIDEMARK_PREFERENCES=rules TIDEMARK_API_KEYS=ci-key TIDEMARK_DB=/tmp/ci-pref.sqlite TIDEMARK_PORT=18201 ./target/release/tidemark &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:18201/health && break; sleep 1; done
+          python3 bench/preference_check.py http://127.0.0.1:18201 ci-key

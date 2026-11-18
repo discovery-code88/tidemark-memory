@@ -9,10 +9,21 @@
 //!
 //! Search returns stored records only; it never writes answers.
 
+mod api;
+mod applies;
+mod assembly;
+mod followups;
 mod dates;
+mod passages;
 mod embed;
+mod http;
+mod llm;
+mod preferences;
+mod reembed;
 mod rerank;
+mod rules;
 mod search;
+mod units;
 
 use axum::{extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::{get, post}, Json, Router};
 use chrono::{DateTime, Utc};
@@ -34,14 +45,16 @@ struct Record {
     user_tokens: Vec<String>,
     /// The user's lines that state a standing instruction or preference.
     instructions: Vec<String>,
+    /// The user's sentences that state a change, stop, resumption or exception (for evidence assembly).
+    changes: Vec<String>,
 }
 
 /// The user-line tokens and standing instructions of a record's content.
-fn user_parts(content: &str) -> (Vec<String>, Vec<String>) {
+fn user_parts(content: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let lines = search::user_lines(content);
     let tokens = lines.iter().flat_map(|l| search::tokens(l)).collect();
     let instructions = lines.into_iter().filter(|l| search::is_standing_instruction(l)).map(|l| l.chars().take(1000).collect()).collect();
-    (tokens, instructions)
+    (tokens, instructions, assembly::change_sentences(content))
 }
 
 struct AppState {
@@ -59,6 +72,13 @@ struct AppState {
     permits: Arc<tokio::sync::Semaphore>,
     embedder: embed::Embedder,
     reranker: Option<Arc<rerank::Reranker>>,
+    /// The optional chat model (`TIDEMARK_LLM_*`); Add and Search never call
+    /// it (preference extraction by the model runs after Add, in the background).
+    llm: Option<Arc<tidemark_engine::ChatModel>>,
+    preferences: preferences::Config,
+    /// Users whose queued preference extraction is being processed.
+    preference_busy: Mutex<std::collections::HashSet<String>>,
+    preference_wake: tokio::sync::Notify,
     keys: Vec<String>,
     settings: Settings,
 }
@@ -75,6 +95,12 @@ struct UserState {
     records: Vec<Record>,
     engine: Option<EngineBackend>,
     bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// BM25 statistics over the records' text and over their user lines,
+    /// kept up to date as records are added.
+    bm25: search::Bm25Index,
+    user_bm25: search::Bm25Index,
+    /// Smaller retrieval units (TIDEMARK_UNITS=on), when built for this user.
+    units: Option<units::UnitIndex>,
 }
 
 impl UserState {
@@ -83,6 +109,8 @@ impl UserState {
             engine.store(user_id, &record);
         }
         self.bytes.fetch_add(record_bytes(&record), std::sync::atomic::Ordering::Relaxed);
+        self.bm25.add(&record.tokens);
+        self.user_bm25.add(&record.user_tokens);
         self.records.push(record);
     }
 }
@@ -129,6 +157,14 @@ struct Settings {
     window: usize,
     /// Fused candidates re-ordered by the cross-encoder (0 = off).
     rerank_candidates: usize,
+    /// Evidence assembly (TIDEMARK_ASSEMBLY=on): at most this many related change records (0 = off).
+    assembly_max: usize,
+    /// Share of the user's records a term may occur in and still count as rare for assembly.
+    assembly_rare: f32,
+    /// Characteristic terms per returned record that define its topic for assembly.
+    assembly_terms: usize,
+    /// Smaller retrieval units (TIDEMARK_UNITS=on): loaded with users and used by default.
+    units: bool,
     /// What the cross-encoder re-orders: the hybrid candidates only, with the
     /// engine's results kept in front ("hybrid"), or the combined list of
     /// engine and hybrid candidates ("all"), so weak engine hits can drop.
@@ -141,12 +177,20 @@ struct Settings {
     /// Weight of the ranking over the user's own lines, added to the main
     /// ranking (0 = off).
     user_weight: f32,
-    /// Slots at the end of the results for the user's standing instructions
-    /// and preferences, most relevant first (0 = off).
+    /// Slots at the end of the results for the user's lines that the cue rules flag as standing instructions or
+    /// preferences, most relevant first (0 = off, the default since 1.2; 1.0.0 used 10). Opt-in because the cue
+    /// rules also flag ordinary text (pasted examples, narrative "I prefer …"), which would be shown as the user's
+    /// standing instruction.
     instruction_slots: usize,
     /// Every part of a split named message repeats the speaker
     /// (TIDEMARK_PART_SPEAKERS=on; off = as evaluated).
     part_speakers: bool,
+    /// Follow-ups (TIDEMARK_FOLLOWUPS): at most this many of the user's statements from other times attached to
+    /// the returned records they relate to (0 = off), and how they are chosen.
+    followups: followups::Options,
+    /// When a statement applies (TIDEMARK_APPLIES=on): the period a returned user sentence states for itself,
+    /// resolved against its record's date, as a note and an `applies` field. Computed at Search; nothing stored.
+    applies: bool,
 }
 
 impl Settings {
@@ -160,12 +204,25 @@ impl Settings {
             speaker_boost: num("TIDEMARK_SPEAKER_BOOST", 0.0).max(0.0),
             window: (num("TIDEMARK_WINDOW", 5.0) as usize).max(1),
             rerank_candidates: num("TIDEMARK_RERANK_CANDIDATES", 0.0) as usize,
+            assembly_max: if std::env::var("TIDEMARK_ASSEMBLY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on")) { num("TIDEMARK_ASSEMBLY_MAX", 3.0) as usize } else { 0 },
+            assembly_rare: num("TIDEMARK_ASSEMBLY_RARE", 0.15) as f32,
+            assembly_terms: num("TIDEMARK_ASSEMBLY_TERMS", 8.0) as usize,
+            units: std::env::var("TIDEMARK_UNITS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on")),
             rerank_all: std::env::var("TIDEMARK_RERANK_SCOPE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("all")),
             max_results: num("TIDEMARK_MAX_RESULTS", 0.0) as usize,
             max_chars: num("TIDEMARK_MAX_CHARS", 0.0) as usize,
             user_weight: num("TIDEMARK_USER_WEIGHT", 1.0).max(0.0),
-            instruction_slots: num("TIDEMARK_INSTRUCTION_SLOTS", 10.0) as usize,
+            instruction_slots: num("TIDEMARK_INSTRUCTION_SLOTS", 0.0) as usize,
             part_speakers: std::env::var("TIDEMARK_PART_SPEAKERS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on")),
+            followups: followups::Options {
+                max: num("TIDEMARK_FOLLOWUPS", 0.0) as usize,
+                rare: num("TIDEMARK_FOLLOWUP_RARE", 0.05),
+                min_terms: num("TIDEMARK_FOLLOWUP_MIN_TERMS", 0.0) as usize,
+                any_time: std::env::var("TIDEMARK_FOLLOWUP_SCOPE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("any")),
+                anchor_share: num("TIDEMARK_FOLLOWUP_ANCHOR_SHARE", 0.5).clamp(0.0, 1.0),
+                max_chars: num("TIDEMARK_FOLLOWUP_CHARS", 400.0) as usize,
+            },
+            applies: std::env::var("TIDEMARK_APPLIES").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on")),
         }
     }
 }
@@ -176,6 +233,12 @@ struct Message {
     role: String,
     #[serde(default)]
     timestamp: Option<i64>,
+    /// The sender's offset from UTC in minutes at the time of the message (120 = UTC+02:00), optional. With it,
+    /// the record's date header and its time notes ("yesterday", "tomorrow") use the sender's calendar day; the
+    /// stored `created_at` stays the UTC instant. Without it, everything is in UTC as before. A fixed offset is not
+    /// a time zone: it says nothing about daylight-saving changes on other days.
+    #[serde(default)]
+    utc_offset_minutes: Option<i32>,
     content: serde_json::Value,
 }
 
@@ -206,6 +269,53 @@ struct SearchRequest {
 
     #[serde(default)]
     instruction_slots: Option<usize>,
+    /// Per-request override of TIDEMARK_ENGINE_MERGE ("first" or "fused").
+    #[serde(default)]
+    engine_merge: Option<String>,
+    /// Per-request override of TIDEMARK_SEARCH_RULES (the user's active explicit rules in a separate `rules` field),
+    /// and a scope that limits them to that scope plus unscoped rules.
+    #[serde(default)]
+    rules: Option<bool>,
+    #[serde(default)]
+    rule_scope: Option<String>,
+    /// Per-request overrides of TIDEMARK_PASSAGES, TIDEMARK_PASSAGE_MAX_CHARS and TIDEMARK_PASSAGE_MIN_WORDS.
+    #[serde(default)]
+    passages: Option<bool>,
+    #[serde(default)]
+    passage_max_chars: Option<usize>,
+    #[serde(default)]
+    passage_min_words: Option<usize>,
+    /// Per-request overrides of TIDEMARK_PREFERENCE_SLOTS and TIDEMARK_PREFERENCE_LABELS.
+    #[serde(default)]
+    preference_slots: Option<usize>,
+    #[serde(default)]
+    preference_labels: Option<String>,
+    /// Per-request switch and cap for evidence assembly (TIDEMARK_ASSEMBLY, TIDEMARK_ASSEMBLY_MAX).
+    #[serde(default)]
+    assembly: Option<bool>,
+    #[serde(default)]
+    assembly_max: Option<usize>,
+    /// Per-request overrides of TIDEMARK_FOLLOWUPS, TIDEMARK_FOLLOWUP_SCOPE ("later" or "any"),
+    /// TIDEMARK_FOLLOWUP_RARE, TIDEMARK_FOLLOWUP_MIN_TERMS, TIDEMARK_FOLLOWUP_CHARS and
+    /// TIDEMARK_FOLLOWUP_ANCHOR_SHARE.
+    #[serde(default)]
+    followups: Option<usize>,
+    #[serde(default)]
+    followup_scope: Option<String>,
+    #[serde(default)]
+    followup_rare: Option<f32>,
+    #[serde(default)]
+    followup_min_terms: Option<usize>,
+    #[serde(default)]
+    followup_chars: Option<usize>,
+    #[serde(default)]
+    followup_anchor_share: Option<f32>,
+    /// Per-request override of TIDEMARK_APPLIES.
+    #[serde(default)]
+    applies: Option<bool>,
+    /// Per-request switch for smaller retrieval units (effective when TIDEMARK_UNITS=on loaded them).
+    #[serde(default)]
+    units: Option<bool>,
     /// Per-request overrides of TIDEMARK_RERANK_CANDIDATES and TIDEMARK_RERANK_SCOPE.
     #[serde(default)]
     rerank_candidates: Option<usize>,
@@ -316,9 +426,38 @@ fn date_header(ts: Option<i64>) -> (String, Option<chrono::NaiveDate>, Option<St
     }
 }
 
-/// The records of one message, as the reader will see them.
+/// The header, calendar day and UTC instant of a message sent at a known offset from UTC: the header and the day
+/// are the sender's local ones, marked with the offset; the instant (`created_at`) is unchanged. Without an offset
+/// this is `date_header`.
+fn date_header_at(ts: Option<i64>, offset: Option<i32>) -> (String, Option<chrono::NaiveDate>, Option<String>) {
+    let Some(offset) = offset else { return date_header(ts) };
+    match ts.and_then(DateTime::<Utc>::from_timestamp_millis) {
+        Some(dt) => {
+            let local = dt.naive_utc() + chrono::Duration::minutes(offset as i64);
+            let sign = if offset < 0 { '-' } else { '+' };
+            (
+                format!("[{} UTC{sign}{:02}:{:02}] ", local.format("%A %-d %B %Y, %H:%M"), offset.abs() / 60, offset.abs() % 60),
+                Some(local.date()),
+                Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            )
+        }
+        None => (String::new(), None, None),
+    }
+}
+
+/// The largest offsets in use are UTC−12:00 and UTC+14:00.
+fn valid_offset(offset: i32) -> bool {
+    (-12 * 60..=14 * 60).contains(&offset)
+}
+
+#[cfg(test)]
 fn render(role: &str, text: &str, ts: Option<i64>, previous: Option<&str>, s: &Settings) -> Vec<(String, Option<String>)> {
-    let (header, date, created_at) = date_header(ts);
+    render_at(role, text, ts, None, previous, s)
+}
+
+/// The records of one message, as the reader will see them.
+fn render_at(role: &str, text: &str, ts: Option<i64>, offset: Option<i32>, previous: Option<&str>, s: &Settings) -> Vec<(String, Option<String>)> {
+    let (header, date, created_at) = date_header_at(ts, offset);
     // A message that already names its speaker ("Caroline: …") keeps it.
     let named = speaker_of(text).is_some();
     let speaker = if named || role.trim().is_empty() { String::new() } else { format!("{}: ", role.trim()) };
@@ -372,10 +511,11 @@ fn read_user(db: &Connection, user_id: &str) -> rusqlite::Result<Vec<Record>> {
     let rows = stmt.query_map(params![user_id], |r| {
         let blob: Vec<u8> = r.get(3)?;
         let content: String = r.get(1)?;
-        let (user_tokens, instructions) = user_parts(&content);
+        let (user_tokens, instructions, changes) = user_parts(&content);
         Ok(Record {
             user_tokens,
             instructions,
+            changes,
             id: r.get(0)?,
             speaker: speaker_of(&r.get::<_, String>(4)?),
             tokens: search::tokens(&content),
@@ -394,6 +534,9 @@ fn build_user(user_id: &str, records: Vec<Record>, use_engine: bool) -> UserStat
         records: Vec::with_capacity(records.len()),
         engine: use_engine.then(|| EngineBackend { engine: tidemark_engine::Engine::new(), records: HashMap::new(), rejected: 0 }),
         bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        bm25: search::Bm25Index::default(),
+        user_bm25: search::Bm25Index::default(),
+        units: None,
     };
     for record in records {
         user.push(user_id, record);
@@ -416,7 +559,12 @@ async fn user_state(state: &Arc<AppState>, user_id: &str) -> Result<Arc<Mutex<Us
             let db = st.db.lock().unwrap();
             read_user(&db, &id).map_err(|e| e.to_string())?
         };
-        Ok(build_user(&id, records, st.use_engine))
+        let mut user = build_user(&id, records, st.use_engine);
+        if st.settings.units {
+            let db = st.db.lock().unwrap();
+            user.units = units::load(&db, &id, &user.records).map_err(|e| e.to_string())?;
+        }
+        Ok(user)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -458,8 +606,8 @@ fn user_lock(state: &AppState, user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 /// One line of a block: the message with its speaker and time notes.
-fn block_line(role: &str, text: &str, ts: Option<i64>) -> String {
-    let (_, date, _) = date_header(ts);
+fn block_line(role: &str, text: &str, ts: Option<i64>, offset: Option<i32>) -> String {
+    let (_, date, _) = date_header_at(ts, offset);
     let speaker = if speaker_of(text).is_some() || role.trim().is_empty() { String::new() } else { format!("{}: ", role.trim()) };
     let notes = date.map(|d| dates::annotate(text, d)).unwrap_or_default();
     let notes = if notes.is_empty() { String::new() } else { format!(" [time: {}]", notes.join("; ")) };
@@ -469,33 +617,43 @@ fn block_line(role: &str, text: &str, ts: Option<i64>) -> String {
 /// Records for consecutive messages grouped `window` at a time: one date
 /// header (the first message's) and one line per message. A message longer
 /// than `max_words` is left out of blocks and split on its own.
+#[cfg(test)]
 fn render_blocks(messages: &[(String, String, Option<i64>)], s: &Settings) -> Vec<(String, String, Option<String>)> {
+    render_blocks_at(messages, &[], s)
+}
+
+/// `offsets` gives each message's offset from UTC, by position (missing = none).
+fn render_blocks_at(messages: &[(String, String, Option<i64>)], offsets: &[Option<i32>], s: &Settings) -> Vec<(String, String, Option<String>)> {
+    type Timed<'a> = (&'a (String, String, Option<i64>), Option<i32>);
     let mut out = Vec::new();
-    let mut block: Vec<&(String, String, Option<i64>)> = Vec::new();
-    let flush = |block: &mut Vec<&(String, String, Option<i64>)>, out: &mut Vec<(String, String, Option<String>)>| {
+    let mut block: Vec<Timed> = Vec::new();
+    let flush = |block: &mut Vec<Timed>, out: &mut Vec<(String, String, Option<String>)>| {
         if block.is_empty() {
             return;
         }
-        let (header, _, created_at) = date_header(block[0].2);
-        let lines = block.iter().map(|(role, text, ts)| block_line(role, text, *ts)).collect::<Vec<_>>();
-        let raw = block.iter().map(|(_, text, _)| text.trim()).collect::<Vec<_>>().join("\n");
+        let (header, _, created_at) = date_header_at(block[0].0.2, block[0].1);
+        let lines = block.iter().map(|((role, text, ts), offset)| block_line(role, text, *ts, *offset)).collect::<Vec<_>>();
+        let raw = block.iter().map(|((_, text, _), _)| text.trim()).collect::<Vec<_>>().join("\n");
         out.push((raw, format!("{header}\n{}", lines.join("\n")).trim_start().to_string(), created_at));
         block.clear();
     };
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
+        let offset = offsets.get(i).copied().flatten();
         if too_long(&m.1, s.max_words) {
             flush(&mut block, &mut out);
-            for ((content, created_at), part) in render(&m.0, &m.1, m.2, None, s).into_iter().zip(embed_texts(&m.0, &m.1, s)) {
+            for ((content, created_at), part) in render_at(&m.0, &m.1, m.2, offset, None, s).into_iter().zip(embed_texts(&m.0, &m.1, s)) {
                 out.push((part, content, created_at));
             }
             continue;
         }
         // A block shows one date, so a message from another day starts a new
-        // block (messages of the same day keep sharing one).
-        if block.first().is_some_and(|first| date_header(first.2).1 != date_header(m.2).1) {
+        // block (messages of the same day keep sharing one). With offsets the
+        // day is the sender's, and the header names the offset, so a change of
+        // offset also starts a new block.
+        if block.first().is_some_and(|(first, first_offset)| date_header_at(first.2, *first_offset).1 != date_header_at(m.2, offset).1 || *first_offset != offset) {
             flush(&mut block, &mut out);
         }
-        block.push(m);
+        block.push((m, offset));
         if block.len() == s.window {
             flush(&mut block, &mut out);
         }
@@ -516,6 +674,9 @@ async fn add(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Resul
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
+    if let Some(bad) = req.messages.iter().filter_map(|m| m.utc_offset_minutes).find(|o| !valid_offset(*o)) {
+        return error(StatusCode::BAD_REQUEST, format!("utc_offset_minutes must be between -720 and 840, got {bad}"));
+    }
     let ok = || Json(serde_json::json!({"success": true, "request_id": req.request_id, "user_id": req.user_id, "session_id": req.session_id})).into_response();
     let lock = user_lock(&state, &req.user_id);
     let _guard = lock.lock().await;
@@ -541,9 +702,11 @@ async fn add(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Resul
     let request_key = short_hash(&format!("{}\u{0}{}", req.user_id, req.request_id));
     let mut rows = Vec::new();
     if state.settings.window > 1 {
-        let messages = req.messages.iter().map(|m| (m.role.clone(), content_text(&m.content), m.timestamp))
-            .filter(|m| !m.1.trim().is_empty()).collect::<Vec<_>>();
-        for (bi, (raw, content, created_at)) in render_blocks(&messages, &state.settings).into_iter().enumerate() {
+        let kept = req.messages.iter().map(|m| ((m.role.clone(), content_text(&m.content), m.timestamp), m.utc_offset_minutes))
+            .filter(|(m, _)| !m.1.trim().is_empty()).collect::<Vec<_>>();
+        let offsets = kept.iter().map(|(_, o)| *o).collect::<Vec<_>>();
+        let messages = kept.into_iter().map(|(m, _)| m).collect::<Vec<_>>();
+        for (bi, (raw, content, created_at)) in render_blocks_at(&messages, &offsets, &state.settings).into_iter().enumerate() {
             rows.push((format!("{}#b{}", request_key, bi), raw.clone(), raw, content, created_at));
         }
     }
@@ -553,7 +716,7 @@ async fn add(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Resul
             continue;
         }
         let parts = embed_texts(&m.role, &text, &state.settings);
-        for (pi, ((content, created_at), part)) in render(&m.role, &text, m.timestamp, previous.as_deref(), &state.settings).into_iter().zip(parts).enumerate() {
+        for (pi, ((content, created_at), part)) in render_at(&m.role, &text, m.timestamp, m.utc_offset_minutes, previous.as_deref(), &state.settings).into_iter().zip(parts).enumerate() {
             let id = format!("{}#{}.{}", request_key, mi, pi);
             // The whole message stays the stored text (the next message's context).
             rows.push((id, text.clone(), part, content, created_at));
@@ -561,8 +724,20 @@ async fn add(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Resul
         previous = Some(text);
     }
     // Embed the speaker and words; dates are matched lexically.
-    let embed_inputs = rows.iter().map(|(_, _, embed, _, _)| embed.clone()).collect::<Vec<_>>();
-    let vectors = match state.embedder.embed_counted(&embed_inputs).await {
+    let mut embed_inputs = rows.iter().map(|(_, _, embed, _, _)| embed.clone()).collect::<Vec<_>>();
+    // The user's own words in each new record, for preference extraction:
+    // found by the rules now (embedded with the records), or queued for the model.
+    let user_messages = req.messages.iter().filter(|m| m.role.trim().eq_ignore_ascii_case("user")).map(|m| content_text(&m.content)).collect::<Vec<_>>();
+    let user_texts = match state.preferences.mode {
+        preferences::Mode::Off => Vec::new(),
+        _ => preferences::user_texts(&rows.iter().map(|(id, raw, _, _, at)| (id.clone(), raw.clone(), at.clone())).collect::<Vec<_>>(), &user_messages),
+    };
+    let rule_preferences = match state.preferences.mode {
+        preferences::Mode::Rules => user_texts.iter().flat_map(|(id, text, at)| preferences::rule_candidates(id, text, at.as_deref())).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    embed_inputs.extend(rule_preferences.iter().map(preferences::Candidate::index_text));
+    let vectors = match state.embedder.embed_counted(&embed_inputs, embed::Kind::Document).await {
         Ok((v, tokens)) => {
             // Tokens of this Add and since start (searches included).
             eprintln!("add user={} records={} embed_tokens={tokens} total_embed_tokens={}", req.user_id, v.len(), embed::TOKENS_USED.load(std::sync::atomic::Ordering::Relaxed));
@@ -573,18 +748,24 @@ async fn add(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Resul
             return error(StatusCode::SERVICE_UNAVAILABLE, e);
         }
     };
+    let mut vectors = vectors;
+    let preference_vectors = vectors.split_off(rows.len());
     let records = rows
         .iter()
         .zip(vectors)
-        .map(|((id, raw, _, content, created_at), embedding)| Record {
-            user_tokens: user_parts(content).0,
-            instructions: user_parts(content).1,
+        .map(|((id, raw, _, content, created_at), embedding)| {
+            let (user_tokens, instructions, changes) = user_parts(content);
+            Record {
+            user_tokens,
+            instructions,
+            changes,
             id: id.clone(),
             speaker: speaker_of(raw),
             tokens: search::tokens(content),
             content: content.clone(),
             created_at: created_at.clone(),
             embedding,
+            }
         })
         .collect::<Vec<_>>();
     {
@@ -603,11 +784,21 @@ async fn add(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Resul
                 )?;
             }
             tx.execute("INSERT INTO user_requests (user_id, request_id, session_id) VALUES (?1, ?2, ?3)", params![req.user_id, req.request_id, req.session_id])?;
+            match state.preferences.mode {
+                preferences::Mode::Rules => {
+                    preferences::store(&tx, &req.user_id, &rule_preferences.iter().cloned().zip(preference_vectors).collect::<Vec<_>>())?;
+                }
+                preferences::Mode::Llm => preferences::enqueue(&tx, &req.user_id, &user_texts, state.preferences.delay)?,
+                preferences::Mode::Off => {}
+            }
             Ok(())
         })();
         if let Err(e) = result.and_then(|_| tx.commit()) {
             return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
+    }
+    if state.preferences.mode == preferences::Mode::Llm && !user_texts.is_empty() {
+        state.preference_wake.notify_waiters();
     }
     // Loaded after the commit, a user not in memory comes back with these
     // records already; one in memory gets them appended.
@@ -680,7 +871,7 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     if req.top_k == 0 {
         return Json(serde_json::json!({"data": []})).into_response();
     }
-    let qv = match state.embedder.embed(&[query.clone()]).await {
+    let qv = match state.embedder.embed(&[query.clone()], embed::Kind::Query).await {
         Ok(mut v) => v.remove(0),
         Err(e) => {
             eprintln!("search user={} embedding failed: {e}", req.user_id);
@@ -704,23 +895,53 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     let max_chars = req.max_chars.unwrap_or(settings.max_chars);
     let user_weight = req.user_weight.unwrap_or(settings.user_weight).max(0.0);
     let instruction_slots = req.instruction_slots.unwrap_or(settings.instruction_slots);
+    let preference_slots = req.preference_slots.unwrap_or(state.preferences.slots);
+    let use_units = req.units.unwrap_or(settings.units);
+    let assembly_max = match (req.assembly, req.assembly_max) {
+        (Some(false), _) => 0,
+        (_, Some(n)) => n,
+        (Some(true), None) => if settings.assembly_max > 0 { settings.assembly_max } else { 3 },
+        (None, None) => settings.assembly_max,
+    };
+    let followup = followups::Options {
+        max: req.followups.unwrap_or(settings.followups.max),
+        rare: req.followup_rare.unwrap_or(settings.followups.rare),
+        min_terms: req.followup_min_terms.unwrap_or(settings.followups.min_terms),
+        any_time: req.followup_scope.as_deref().map_or(settings.followups.any_time, |v| v.trim().eq_ignore_ascii_case("any")),
+        max_chars: req.followup_chars.unwrap_or(settings.followups.max_chars),
+        anchor_share: req.followup_anchor_share.unwrap_or(settings.followups.anchor_share).clamp(0.0, 1.0),
+    };
+    let applies_on = req.applies.unwrap_or(settings.applies);
+    let env_num = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(default);
+    let passages_on = req.passages.unwrap_or_else(|| std::env::var("TIDEMARK_PASSAGES").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on")));
+    let passage_opts = passages::Options {
+        max_chars: req.passage_max_chars.unwrap_or_else(|| env_num("TIDEMARK_PASSAGE_MAX_CHARS", 400)).max(40),
+        min_words: req.passage_min_words.unwrap_or_else(|| env_num("TIDEMARK_PASSAGE_MIN_WORDS", 120)),
+    };
     let rerank_candidates = req.rerank_candidates.unwrap_or(settings.rerank_candidates);
     let rerank_all = req.rerank_scope.as_deref().map_or(settings.rerank_all, |v| v.trim().eq_ignore_ascii_case("all"));
     // Ranking is CPU work on the user's records, done in place without copying them.
-    let data = tokio::task::block_in_place(|| {
+    let mut data = tokio::task::block_in_place(|| {
         let mut guard = user.lock().unwrap();
         let user = &mut *guard;
         // With the memory engine, its ranking comes first; the hybrid ranking
-        // fills the remaining slots (the engine keeps only what it judges
-        // relevant, usually far fewer than top_k).
+        // fills the remaining slots, if any: the engine's hits can fill all of
+        // top_k, and then the hybrid ranking has no influence on the results.
+        // TIDEMARK_LOG_TIMING=1 logs how long each step of a search takes.
+        let timing = std::env::var_os("TIDEMARK_LOG_TIMING").is_some();
+        let mut marks: Vec<(&str, std::time::Instant)> = vec![("start", std::time::Instant::now())];
+        // TIDEMARK_ENGINE_MERGE=fused (per request `engine_merge`): see the merge below. Fusion needs the engine's
+        // ranking beyond `top_k` (at least 100), or records it ranks lower get no engine score at all.
+        let merge_fused = req.engine_merge.clone().or_else(|| std::env::var("TIDEMARK_ENGINE_MERGE").ok()).is_some_and(|v| v.trim().eq_ignore_ascii_case("fused"));
+        let engine_depth = if merge_fused { req.top_k.max(rerank_candidates).max(100) } else { req.top_k.max(rerank_candidates) };
         let engine_first: Vec<String> = match &mut user.engine {
             Some(engine) => {
-                let hits = engine.engine.search(&req.user_id, &query, req.top_k.max(rerank_candidates).saturating_mul(3));
+                let hits = engine.engine.search(&req.user_id, &query, engine_depth.saturating_mul(3));
                 let mut seen = std::collections::HashSet::new();
                 hits.into_iter()
                     .filter_map(|hit| engine.records.get(&hit.id).map(|(id, _)| id.clone()))
                     .filter(|id| seen.insert(id.clone()))
-                    .take(req.top_k.max(rerank_candidates))
+                    .take(engine_depth)
                     .collect()
             }
             None => Vec::new(),
@@ -729,16 +950,24 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         if records.is_empty() {
             return Vec::new();
         }
-        let bm = search::Bm25::new(records.iter().map(|r| r.tokens.as_slice()).collect());
-        let lexical = bm.scores(&search::tokens(&query));
+        marks.push(("engine", std::time::Instant::now()));
+        marks.push(("bm25 index", std::time::Instant::now()));
+        let lexical = user.bm25.scores(records.iter().map(|r| r.tokens.as_slice()), &search::tokens(&query));
+        marks.push(("bm25 score", std::time::Instant::now()));
         let vector = records.iter().map(|r| embed::cosine(&qv, &r.embedding)).collect::<Vec<_>>();
+        marks.push(("cosine", std::time::Instant::now()));
         let mut fused = search::fuse(&lexical, &vector, settings.lexical_weight, settings.rrf_k);
+        // Smaller units: the same fusion over units; each record scored by its best unit.
+        if use_units {
+            if let Some(index) = &user.units {
+                fused = units::rank_records(index, &search::tokens(&query), &qv, records.len(), &settings, &fused);
+            }
+        }
         // The user's own lines ranked on their own: questions are mostly about
         // what the user said, which long replies around it would outweigh.
         let query_tokens = search::tokens(&query);
         if user_weight > 0.0 && records.iter().any(|r| !r.user_tokens.is_empty()) {
-            let ubm = search::Bm25::new(records.iter().map(|r| r.user_tokens.as_slice()).collect());
-            let ulex = ubm.scores(&query_tokens);
+            let ulex = user.user_bm25.scores(records.iter().map(|r| r.user_tokens.as_slice()), &query_tokens);
             // Records without user lines get no vector rank.
             let uvec = records.iter().zip(&vector).map(|(r, v)| if r.user_tokens.is_empty() { -2.0 } else { *v }).collect::<Vec<_>>();
             let mut extra = vec![0.0f32; records.len()];
@@ -750,6 +979,7 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
             }
             fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         }
+        marks.push(("fuse + user lines", std::time::Instant::now()));
         // Standing instructions and preferences, ranked among themselves.
         let instructions: Vec<(usize, &str)> = if instruction_slots > 0 {
             let all = records.iter().enumerate().flat_map(|(i, r)| r.instructions.iter().map(move |t| (i, t.as_str()))).collect::<Vec<_>>();
@@ -807,7 +1037,23 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         if !rerank_all {
             fused = rerank(fused);
         }
-        if !engine_first.is_empty() {
+        // TIDEMARK_ENGINE_MERGE=fused (per request `engine_merge`): instead of the engine's hits first and the hybrid
+        // ranking filling the rest, the two rankings are combined by reciprocal rank (TIDEMARK_RRF_K), so a record
+        // either ranking places high can reach the results. Default "first" (unchanged).
+        if !engine_first.is_empty() && merge_fused {
+            let position = records.iter().enumerate().map(|(i, r)| (r.id.as_str(), i)).collect::<HashMap<_, _>>();
+            let mut score: HashMap<usize, f32> = HashMap::new();
+            for (rank, i) in engine_first.iter().filter_map(|id| position.get(id.as_str()).copied()).enumerate() {
+                *score.entry(i).or_default() += 1.0 / (settings.rrf_k + rank as f32 + 1.0);
+            }
+            for (rank, (i, _)) in fused.iter().enumerate() {
+                *score.entry(*i).or_default() += 1.0 / (settings.rrf_k + rank as f32 + 1.0);
+            }
+            // The hybrid ranking covers every record; ties keep its order (stable sort over it).
+            let mut merged = fused.iter().map(|(i, _)| (*i, score.get(i).copied().unwrap_or(0.0))).collect::<Vec<_>>();
+            merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            fused = merged;
+        } else if !engine_first.is_empty() {
             let position = records.iter().enumerate().map(|(i, r)| (r.id.as_str(), i)).collect::<HashMap<_, _>>();
             let head = engine_first.iter().filter_map(|id| position.get(id.as_str()).copied()).collect::<Vec<_>>();
             let head_set = head.iter().copied().collect::<std::collections::HashSet<_>>();
@@ -819,9 +1065,14 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         if rerank_all {
             fused = rerank(fused);
         }
-        // Instructions take the last slots, after the ranked records, so the
-        // ranking itself is unchanged; the content budget is shared. At most a
-        // tenth of the results are instructions (10 of AML's 100). With
+        marks.push(("instructions + rerank + merge", std::time::Instant::now()));
+        if timing {
+            let parts = marks.windows(2).map(|w| format!("{} {}ms", w[1].0, (w[1].1 - w[0].1).as_millis())).collect::<Vec<_>>();
+            eprintln!("search timing user={} records={}: {}", req.user_id, records.len(), parts.join(", "));
+        }
+        // Instructions (only when instruction slots are enabled) take the last slots, after the ranked records, so
+        // the ranking itself is unchanged; the content budget is shared. At most a tenth of the results are
+        // instructions (10 of AML's 100 with TIDEMARK_INSTRUCTION_SLOTS=10, the 1.0.0 default). With
         // TIDEMARK_INSTRUCTION_DEDUP=on, an instruction whose record is already
         // among the results is skipped and its slot goes to the next record.
         let slots = instruction_slots.min(limit / 10).min(instructions.len());
@@ -849,6 +1100,78 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
             })
             .map(|(_, (i, score))| (records[i].id.clone(), records[i].content.clone(), score, i))
             .collect::<Vec<_>>();
+        // Evidence assembly: related change records join their anchors in the places of unprotected results.
+        let mut related_to: HashMap<String, (String, Vec<String>)> = HashMap::new();
+        if assembly_max > 0 {
+            let ranked = items.iter().map(|it| it.3).collect::<Vec<_>>();
+            let (ordered, groups) = assembly::assemble(records, &ranked, &user.user_bm25, assembly_max, settings.assembly_rare, settings.assembly_terms);
+            if !groups.is_empty() {
+                let terms_of = groups.iter().map(|g| (g.record, g.terms.clone())).collect::<HashMap<_, _>>();
+                let score_of = items.iter().map(|it| (it.3, it.2)).collect::<HashMap<_, _>>();
+                let mut last_score = items.first().map_or(1.0, |it| it.2);
+                items = ordered
+                    .into_iter()
+                    .map(|(i, anchor)| {
+                        let score = match anchor {
+                            Some(a) => score_of.get(&a).copied().unwrap_or(last_score) - 1e-4,
+                            None => score_of[&i],
+                        };
+                        last_score = score;
+                        if let Some(a) = anchor {
+                            related_to.insert(records[i].id.clone(), (records[a].id.clone(), terms_of.get(&i).cloned().unwrap_or_default()));
+                        }
+                        (records[i].id.clone(), records[i].content.clone(), score, i)
+                    })
+                    .collect();
+            }
+        }
+        // Follow-ups: the user's statements from other times, attached to the returned records they relate to.
+        // They take no slot and change no rank; the content budget still holds.
+        let mut followed: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        let mut used = items.iter().map(|it| it.1.chars().count()).sum::<usize>() + reserved_chars;
+        // When a returned statement applies: the period its own words state, resolved against its record's date.
+        let mut periods: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        if applies_on {
+            for item in items.iter_mut() {
+                let Some(said) = applies::said_in(&records[item.3].content, records[item.3].created_at.as_deref()) else { continue };
+                for (sentence, a) in applies::of_record(&records[item.3].content, said) {
+                    let note = a.note();
+                    if max_chars > 0 && used + note.chars().count() + 1 > max_chars {
+                        break;
+                    }
+                    used += note.chars().count() + 1;
+                    item.1.push('\n');
+                    item.1.push_str(&note);
+                    periods.entry(item.0.clone()).or_default().push(a.json(&sentence));
+                }
+            }
+        }
+        if followup.max > 0 {
+            let ranked = items.iter().map(|it| it.3).collect::<Vec<_>>();
+            for f in followups::find(records, &ranked, &query_tokens, &user.user_bm25, followup) {
+                let mut line = followups::line(records, &f);
+                let stated = if applies_on { applies::said_in(&records[f.record].content, records[f.record].created_at.as_deref()).map(|said| applies::extract(&f.sentence, said)).unwrap_or_default() } else { Vec::new() };
+                for a in &stated {
+                    line.push(' ');
+                    line.push_str(&a.note());
+                }
+                if max_chars > 0 && used + line.chars().count() + 1 > max_chars {
+                    break;
+                }
+                used += line.chars().count() + 1;
+                let Some(item) = items.iter_mut().find(|it| it.3 == f.anchor) else { continue };
+                item.1.push('\n');
+                item.1.push_str(&line);
+                let mut entry = serde_json::json!({
+                    "id": records[f.record].id, "created_at": records[f.record].created_at, "text": f.sentence,
+                    "relation": if f.later { "later" } else { "other_time" }, "shared_terms": f.terms,
+                });
+                if !stated.is_empty() {
+                    entry["applies"] = serde_json::json!(stated.iter().map(|a| a.json(&f.sentence)).collect::<Vec<_>>());
+                }
+                followed.entry(item.0.clone()).or_default().push(entry);
+            }
+        }
         let last = items.last().map_or(1.0, |it| it.2);
         items.extend(instruction_items.into_iter().enumerate().map(|(j, (id, content, i))| (id, content, last - (j + 1) as f32 * 1e-3, i)));
         items
@@ -858,15 +1181,70 @@ async fn search_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, 
                 if let Some(c) = &records[i].created_at {
                     item["created_at"] = serde_json::json!(c);
                 }
+                if let Some(f) = followed.get(&id) {
+                    item["followups"] = serde_json::json!(f);
+                }
+                if let Some(p) = periods.get(&id) {
+                    item["applies"] = serde_json::json!(p);
+                }
+                if passages_on && id == records[i].id {
+                    let n = user.bm25.len() as f32;
+                    let idf = |t: &str| {
+                        let df = user.bm25.df(t) as f32;
+                        (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+                    };
+                    if let Some(p) = passages::best(&records[i].content, &query_tokens, idf, passage_opts) {
+                        item["passage"] = p.json();
+                    }
+                }
+                if let Some((anchor, terms)) = related_to.get(&id) {
+                    item["kind"] = serde_json::json!("related");
+                    item["related_to"] = serde_json::json!(anchor);
+                    item["related_terms"] = serde_json::json!(terms);
+                }
                 item
             })
             .collect::<Vec<_>>()
     });
-    Json(serde_json::json!({"data": data})).into_response()
+    // The user's most relevant current preferences take the last slots.
+    if preference_slots > 0 && limit > 0 {
+        let prefs = preferences::load(&state.db.lock().unwrap(), &req.user_id, false).unwrap_or_default();
+        let ranked = preferences::rank(&prefs, &search::tokens(&query), &qv, preference_slots.min(limit), &settings);
+        let novelty = preferences::asks_for_novelty(&query);
+        let labels = req.preference_labels.as_deref().and_then(preferences::Labels::parse).unwrap_or(state.preferences.labels);
+        if !ranked.is_empty() {
+            data.truncate(limit - ranked.len());
+            let last = data.last().and_then(|d| d["score"].as_f64()).unwrap_or(1.0) as f32;
+            data.extend(ranked.iter().enumerate().map(|(j, (i, _))| {
+                let p = &prefs[*i];
+                let mut item = serde_json::json!({"id": p.id, "content": p.render(labels, novelty), "score": last - (j + 1) as f32 * 1e-3, "kind": "preference"});
+                if let Some(at) = &p.stated_at {
+                    item["created_at"] = serde_json::json!(at);
+                }
+                item
+            }));
+        }
+    }
+    let mut response = serde_json::json!({"data": data});
+    // The user's explicit rules, apart from the results (they take no slot); absent when there are none.
+    let rules_on = req.rules.unwrap_or_else(|| std::env::var("TIDEMARK_SEARCH_RULES").map_or(true, |v| !v.trim().eq_ignore_ascii_case("off")));
+    if rules_on {
+        match rules::for_search(&state.db.lock().unwrap(), &req.user_id, req.rule_scope.as_deref()) {
+            Ok(active) if !active.is_empty() => response["rules"] = serde_json::json!(active),
+            Ok(_) => {}
+            Err(e) => eprintln!("search user={} rules not loaded: {e}", req.user_id),
+        }
+    }
+    Json(response).into_response()
 }
 
 fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let db = Connection::open(path)?;
+    open_schema(&db)?;
+    Ok(db)
+}
+
+fn open_schema(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
          CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -877,9 +1255,13 @@ fn open_db(path: &str) -> rusqlite::Result<Connection> {
          CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS user_requests (user_id TEXT NOT NULL, request_id TEXT NOT NULL, session_id TEXT NOT NULL,
             PRIMARY KEY (user_id, request_id));
-         INSERT OR IGNORE INTO user_requests (user_id, request_id, session_id) SELECT user_id, request_id, session_id FROM requests;",
+         INSERT OR IGNORE INTO user_requests (user_id, request_id, session_id) SELECT user_id, request_id, session_id FROM requests;
+         CREATE TABLE IF NOT EXISTS record_history (record_id TEXT NOT NULL, user_id TEXT NOT NULL, version INTEGER NOT NULL,
+            action TEXT NOT NULL, content TEXT NOT NULL, changed_at TEXT NOT NULL, PRIMARY KEY (user_id, record_id, version));",
     )?;
-    Ok(db)
+    preferences::setup(db)?;
+    rules::setup(db)?;
+    units::setup(db)
 }
 
 
@@ -893,12 +1275,13 @@ async fn check_embedding_provenance(db: &Connection, embedder: &embed::Embedder,
     let model = embedder.label();
     let dims = match embedder {
         embed::Embedder::Hash { dims } => *dims,
-        embed::Embedder::Remote { .. } if std::env::var_os("TIDEMARK_SKIP_EMBED_CHECK").is_some() => {
+        embed::Embedder::Local(local) => local.dims(),
+        embed::Embedder::Remote(_) if std::env::var_os("TIDEMARK_SKIP_EMBED_CHECK").is_some() => {
             eprintln!("tidemark: WARNING: embedding check skipped, so stored vectors are not checked against the model");
             return Ok(());
         }
-        embed::Embedder::Remote { .. } => {
-            embedder.embed(&["dimension check".to_string()]).await?.first().map(Vec::len).ok_or("embedding returned no vector")?
+        embed::Embedder::Remote(_) => {
+            embedder.embed(&["dimension check".to_string()], embed::Kind::Document).await?.first().map(Vec::len).ok_or("embedding returned no vector")?
         }
     };
     let stored = {
@@ -964,6 +1347,21 @@ async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -
 
 #[tokio::main]
 async fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("units") {
+        if let Err(e) = units::build(&args[1..]).await {
+            eprintln!("tidemark units: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().map(String::as_str) == Some("reembed") {
+        if let Err(e) = reembed::run(&args[1..]).await {
+            eprintln!("tidemark reembed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let db_path = std::env::var("TIDEMARK_DB").unwrap_or_else(|_| "tidemark.sqlite".into());
     let port = std::env::var("TIDEMARK_PORT").unwrap_or_else(|_| "18200".into());
     let host = std::env::var("TIDEMARK_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -972,11 +1370,15 @@ async fn main() {
         .query_row("SELECT COUNT(DISTINCT user_id), COUNT(*) FROM records", [], |r| Ok((r.get(0)?, r.get(1)?)))
         .expect("count records");
     let keys = std::env::var("TIDEMARK_API_KEYS").unwrap_or_default().split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect::<Vec<_>>();
+    if let Ok(target) = db.query_row("SELECT value FROM meta WHERE key = ?1", [reembed::IN_PROGRESS], |r| r.get::<_, String>(0)) {
+        eprintln!("tidemark: a re-embed to {target} is unfinished; complete it with `tidemark reembed` or drop it with `tidemark reembed --abort`; not starting");
+        std::process::exit(1);
+    }
     let embedder = embed::Embedder::from_env();
     // A wrong key or URL would fail every Add and Search; refuse to start instead
     // (TIDEMARK_SKIP_EMBED_CHECK=1 skips this, e.g. for offline tests).
-    if matches!(embedder, embed::Embedder::Remote { .. }) && std::env::var_os("TIDEMARK_SKIP_EMBED_CHECK").is_none() {
-        match embedder.embed(&["startup check".to_string()]).await {
+    if embedder.is_remote() && std::env::var_os("TIDEMARK_SKIP_EMBED_CHECK").is_none() {
+        match embedder.embed(&["startup check".to_string()], embed::Kind::Query).await {
             Ok(v) => eprintln!("tidemark: embedding check ok ({} dimensions)", v.first().map(Vec::len).unwrap_or(0)),
             Err(e) => {
                 eprintln!("tidemark: embedding check failed, not starting: {e}");
@@ -988,7 +1390,47 @@ async fn main() {
         eprintln!("tidemark: {e}; not starting");
         std::process::exit(1);
     }
-    let reranker = rerank::Reranker::from_env().expect("load reranker").map(Arc::new);
+    let reranker = match rerank::Reranker::from_env() {
+        Ok(r) => r.map(Arc::new),
+        Err(e) => {
+            eprintln!("tidemark: reranker: {e}; not starting");
+            std::process::exit(1);
+        }
+    };
+    // As with embeddings, a wrong reranking key or URL is found at start
+    // (TIDEMARK_SKIP_RERANK_CHECK=1 skips this).
+    if let Some(rerank::Reranker::Remote(remote)) = reranker.as_deref() {
+        if std::env::var_os("TIDEMARK_SKIP_RERANK_CHECK").is_none() {
+            match remote.scores("startup check", &["startup check"]).await {
+                Ok(_) => eprintln!("tidemark: rerank check ok"),
+                Err(e) => {
+                    eprintln!("tidemark: rerank check failed, not starting: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    let llm = match llm::from_env().await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("tidemark: {e}; not starting");
+            std::process::exit(1);
+        }
+    };
+    let preference_config = match preferences::Config::from_env() {
+        Ok(c) if c.mode == preferences::Mode::Llm && llm.is_none() => {
+            eprintln!("tidemark: TIDEMARK_PREFERENCES=llm needs a language model (TIDEMARK_LLM_*); not starting");
+            std::process::exit(1);
+        }
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("tidemark: {e}; not starting");
+            std::process::exit(1);
+        }
+    };
+    if reranker.is_some() && Settings::from_env().rerank_candidates == 0 {
+        eprintln!("tidemark: a reranker is configured but TIDEMARK_RERANK_CANDIDATES is 0: it is used only by searches that set rerank_candidates");
+    }
     let use_engine = matches!(std::env::var("TIDEMARK_BACKEND").unwrap_or_else(|_| "engine".into()).trim(), "engine" | "");
     let cache_mb = std::env::var("TIDEMARK_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048).max(16);
     let st = Settings::from_env();
@@ -1006,10 +1448,12 @@ async fn main() {
         std::env::var("TIDEMARK_MAX_CONCURRENT").unwrap_or_else(|_| "8".into())
     );
     eprintln!(
-        "tidemark: {users} users, {records} records in {db_path} (loaded per user on demand, cache {cache_mb} MB); backend {}; embeddings {}; rerank {}; auth {}",
+        "tidemark: {users} users, {records} records in {db_path} (loaded per user on demand, cache {cache_mb} MB); backend {}; embeddings {}; rerank {}; language model {}; preferences {}; auth {}",
         if use_engine { "engine" } else { "builtin" },
         embedder.label(),
-        reranker.as_ref().map(|r| r.label.clone()).unwrap_or_else(|| "off".into()),
+        reranker.as_ref().map(|r| r.label()).unwrap_or_else(|| "off".into()),
+        llm.as_ref().map(|m| m.label()).unwrap_or_else(|| "off".into()),
+        format!("{:?} ({} slots)", preference_config.mode, preference_config.slots).to_lowercase(),
         if keys.is_empty() { "OFF (set TIDEMARK_API_KEYS)" } else { "on" }
     );
     let state = Arc::new(AppState {
@@ -1024,13 +1468,30 @@ async fn main() {
         )),
         embedder,
         reranker,
+        llm,
+        preferences: preference_config,
+        preference_busy: Mutex::new(Default::default()),
+        preference_wake: tokio::sync::Notify::new(),
         keys,
         settings: Settings::from_env(),
     });
+    if state.preferences.mode == preferences::Mode::Llm {
+        preferences::spawn(state.clone());
+    }
     let app = Router::new()
         .route("/health", get(|| async { Json(serde_json::json!({"status": "ok", "service": "tidemark", "version": env!("CARGO_PKG_VERSION")})) }))
         .route("/add", post(add))
         .route("/search", post(search_handler))
+        .route("/memories", get(api::list))
+        .route("/memories/:id", get(api::get_one).patch(api::update).delete(api::delete_one))
+        .route("/memories/:id/history", get(api::history))
+        .route("/users/:user_id", axum::routing::delete(api::delete_user))
+        .route("/preferences", get(api::list_preferences).post(api::create_preference))
+        .route("/preferences/:id", get(api::get_preference).patch(api::update_preference).delete(api::delete_preference))
+        .route("/preferences/:id/history", get(api::preference_history))
+        .route("/rules", get(rules::list_rules).post(rules::create_rule))
+        .route("/rules/:id", get(rules::get_rule).patch(rules::update_rule).delete(rules::delete_rule))
+        .route("/rules/:id/history", get(rules::rule_history))
         // Add requests may carry long messages or base64 images (up to 30 MB).
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         // Gzip responses when the client accepts it: a 100-record Search answer
@@ -1049,8 +1510,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instruction_slots_are_off_unless_configured() {
+        // 1.2 default (1.0.0 used 10). Only checked when the environment does not set it.
+        if std::env::var_os("TIDEMARK_INSTRUCTION_SLOTS").is_none() {
+            assert_eq!(Settings::from_env().instruction_slots, 0);
+        }
+    }
+
+    #[test]
     fn a_record_carries_its_date_speaker_time_notes_and_reply_context() {
-        let s = Settings { max_words: 300, previous_context_chars: 20, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 1, rerank_candidates: 0, rerank_all: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false };
+        let s = Settings { max_words: 300, previous_context_chars: 20, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 1, rerank_candidates: 0, rerank_all: false, assembly_max: 0, assembly_rare: 0.15, assembly_terms: 8, units: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false, followups: followups::Options { max: 0, rare: 0.05, min_terms: 0, any_time: false, anchor_share: 0.5, max_chars: 400 }, applies: false };
         // 8 May 2023 13:56 UTC
         let ts = Some(1683554160000);
         let out = render("user", "Caroline: I went to a support group yesterday.", ts, Some("Melanie: How have you been lately, Caroline?"), &s);
@@ -1060,8 +1529,63 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_gives_the_senders_calendar_day_and_keeps_the_instant() {
+        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, assembly_max: 0, assembly_rare: 0.15, assembly_terms: 8, units: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false, followups: followups::Options { max: 0, rare: 0.05, min_terms: 0, any_time: false, anchor_share: 0.5, max_chars: 400 }, applies: false };
+        // 2025-12-31T22:30:00Z is 00:30 on 1 January 2026 at UTC+02:00.
+        let ts = Some(1767220200000);
+        let utc = render_at("user", "I arrived yesterday.", ts, None, None, &s);
+        assert_eq!(utc[0].0, "[Wednesday 31 December 2025, 22:30] user: I arrived yesterday. [time: yesterday = 30 December 2025]", "without an offset: UTC, as before");
+        assert_eq!(utc, render("user", "I arrived yesterday.", ts, None, &s));
+        let local = render_at("user", "I arrived yesterday.", ts, Some(120), None, &s);
+        assert_eq!(local[0].0, "[Thursday 1 January 2026, 00:30 UTC+02:00] user: I arrived yesterday. [time: yesterday = 31 December 2025]");
+        assert_eq!(local[0].1, utc[0].1, "created_at stays the UTC instant");
+        assert_eq!(local[0].1.as_deref(), Some("2025-12-31T22:30:00Z"));
+        // 2027-01-01T04:30:00Z is 23:30 on 31 December 2026 at UTC−05:00.
+        let west = render_at("user", "I'll arrive tomorrow.", Some(1798777800000), Some(-300), None, &s);
+        assert_eq!(west[0].0, "[Thursday 31 December 2026, 23:30 UTC-05:00] user: I'll arrive tomorrow. [time: tomorrow = 1 January 2027]");
+        assert_eq!(render_at("user", "Hi.", ts, Some(0), None, &s)[0].0, "[Wednesday 31 December 2025, 22:30 UTC+00:00] user: Hi.", "an explicit zero offset is stated");
+        assert_eq!(render_at("user", "Hi.", ts, Some(345), None, &s)[0].0, "[Thursday 1 January 2026, 04:15 UTC+05:45] user: Hi.");
+        assert!(valid_offset(840) && valid_offset(-720) && !valid_offset(841) && !valid_offset(-721));
+        // Mixed offsets in one request: each message's notes use its own offset, never a neighbour's or the header's.
+        let m3 = |t: &str, ts: i64| ("user".to_string(), t.to_string(), Some(ts));
+        // One instant, 2025-12-31T22:30Z, seen from UTC+02:00 (1 January), from no offset (31 December) and from UTC−05:00 (31 December).
+        let mixed = [m3("I arrived yesterday.", 1767220200000), m3("I arrived yesterday.", 1767220200000), m3("I arrived yesterday.", 1767220200000), m3("I leave tomorrow.", 1767220200000)];
+        let blocks = render_blocks_at(&mixed, &[Some(120), None, Some(-300), Some(-300)], &s);
+        assert_eq!(blocks.iter().map(|b| b.1.as_str()).collect::<Vec<_>>(), [
+            "[Thursday 1 January 2026, 00:30 UTC+02:00] \nuser: I arrived yesterday. [time: yesterday = 31 December 2025]",
+            "[Wednesday 31 December 2025, 22:30] \nuser: I arrived yesterday. [time: yesterday = 30 December 2025]",
+            "[Wednesday 31 December 2025, 17:30 UTC-05:00] \nuser: I arrived yesterday. [time: yesterday = 30 December 2025]\nuser: I leave tomorrow. [time: tomorrow = 1 January 2026]",
+        ]);
+        assert!(blocks.iter().all(|b| b.2.as_deref() == Some("2025-12-31T22:30:00Z")), "one instant throughout");
+        // Search-time applies reads the same day as the Add-time note of the same record.
+        for (offset, day) in [(Some(120), "2026-01-02"), (None, "2026-01-01"), (Some(-300), "2026-01-01")] {
+            let record = render_blocks_at(&[m3("From tomorrow I'm off caffeine.", 1767220200000)], &[offset], &s).remove(0);
+            let said = applies::said_in(&record.1, record.2.as_deref()).unwrap();
+            let found = applies::of_record(&record.1, said);
+            assert_eq!(found.len(), 1, "{record:?}");
+            assert_eq!(found[0].1.from.unwrap().iso(), day);
+            let note = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap().format("tomorrow = %-d %B %Y").to_string();
+            assert!(record.1.contains(&note), "{} should carry {note}", record.1);
+        }
+        let single = render_at("user", "From tomorrow I'm off caffeine.", ts, Some(120), None, &s).remove(0);
+        assert_eq!(applies::of_record(&single.0, applies::said_in(&single.0, single.1.as_deref()).unwrap())[0].1.from.unwrap().iso(), "2026-01-02", "one message per record");
+        // Blocks: the day is the sender's; a block has one header, so another local day or another offset starts a new one.
+        let m = |t: &str, ts: i64| ("user".to_string(), t.to_string(), Some(ts));
+        let msgs = [m("I arrived yesterday.", 1767220200000), m("Still here.", 1767223800000)];
+        let same = render_blocks_at(&msgs, &[Some(120), Some(120)], &s);
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].1, "[Thursday 1 January 2026, 00:30 UTC+02:00] \nuser: I arrived yesterday. [time: yesterday = 31 December 2025]\nuser: Still here.");
+        assert_eq!(render_blocks_at(&msgs, &[Some(120), Some(60)], &s).len(), 2, "a different offset is a different header");
+        assert_eq!(render_blocks_at(&msgs, &[], &s), render_blocks(&msgs, &s));
+        // 23:30 and 00:30 UTC are two UTC days but one day at UTC−05:00.
+        let across = [m("One.", 1767223800000), m("Two.", 1767227400000)];
+        assert_eq!(render_blocks(&across, &s).len(), 2);
+        assert_eq!(render_blocks_at(&across, &[Some(-300), Some(-300)], &s).len(), 1);
+    }
+
+    #[test]
     fn messages_are_grouped_into_non_overlapping_dated_blocks() {
-        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 2, rerank_candidates: 0, rerank_all: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false };
+        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 2, rerank_candidates: 0, rerank_all: false, assembly_max: 0, assembly_rare: 0.15, assembly_terms: 8, units: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false, followups: followups::Options { max: 0, rare: 0.05, min_terms: 0, any_time: false, anchor_share: 0.5, max_chars: 400 }, applies: false };
         let ts = Some(1683554160000);
         let m = |t: &str| ("user".to_string(), t.to_string(), ts);
         let long = format!("Caroline: {}", "word ".repeat(400));
@@ -1086,7 +1610,7 @@ mod tests {
 
     #[test]
     fn blocks_split_on_a_new_day_only() {
-        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false };
+        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, assembly_max: 0, assembly_rare: 0.15, assembly_terms: 8, units: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false, followups: followups::Options { max: 0, rare: 0.05, min_terms: 0, any_time: false, anchor_share: 0.5, max_chars: 400 }, applies: false };
         let base = 1704168000000i64; // 2024-01-02 04:00 UTC
         let m = |t: &str, ts: i64| ("user".to_string(), t.to_string(), Some(ts));
         // AML-style: one session, messages five minutes apart -> one block, as before
@@ -1106,7 +1630,7 @@ mod tests {
 
     #[test]
     fn every_part_of_a_split_message_names_its_speaker() {
-        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false };
+        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, assembly_max: 0, assembly_rare: 0.15, assembly_terms: 8, units: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false, followups: followups::Options { max: 0, rare: 0.05, min_terms: 0, any_time: false, anchor_share: 0.5, max_chars: 400 }, applies: false };
         let long = format!("Caroline: {}", (0..700).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" "));
         let off = render("user", &long, Some(1683554160000), None, &s);
         assert!(off.len() >= 3 && off[0].0.contains("] Caroline: ") && !off[1].0.contains("Caroline: "), "default: as evaluated");
@@ -1120,7 +1644,7 @@ mod tests {
 
     #[test]
     fn split_messages_embed_each_part_once_with_its_speaker() {
-        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false };
+        let s = Settings { max_words: 300, previous_context_chars: 0, lexical_weight: 0.5, rrf_k: 60.0, speaker_boost: 0.0, window: 5, rerank_candidates: 0, rerank_all: false, assembly_max: 0, assembly_rare: 0.15, assembly_terms: 8, units: false, max_results: 0, max_chars: 0, user_weight: 0.0, instruction_slots: 0, part_speakers: false, followups: followups::Options { max: 0, rare: 0.05, min_terms: 0, any_time: false, anchor_share: 0.5, max_chars: 400 }, applies: false };
         assert_eq!(embed_texts("user", "Caroline: short one", &s), ["Caroline: short one"], "a message in one record is embedded as is");
         let long = format!("Caroline: {}", (0..700).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" "));
         let parts = embed_texts("user", &long, &s);

@@ -248,3 +248,5 @@ pub(crate) use foresight::*;
 
 pub mod facade;
 pub use facade::{Engine, Hit, Stored};
+pub mod chat;
+pub use chat::{ChatModel, ChatUsage};
